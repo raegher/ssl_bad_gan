@@ -6,6 +6,181 @@ from torch.nn import Parameter
 import numpy as np
 import torch.nn.init as nn_init
 
+
+
+class nnPUloss(nn.Module):
+    def __init__(self, prior, alpha=1., beta=0., gamma=1.):
+        super(nnPUloss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.unlabled = -1
+        self.CEL = nn.CrossEntropyLoss(reduce=False)
+        self.prior = prior
+
+    def forward(self, *input):
+        x, y = input
+        unlabled = (y == self.unlabled)
+        labled = ~unlabled
+        n_unlabled = torch.tensor(max([1.0, torch.sum(unlabled)]), dtype=torch.float32)
+        n_cls = len(self.prior)
+        self.loss = None
+        unrisk = []
+        inds_y = []
+        n_inds_y = []
+        for i in range(n_cls):
+            inds_y.append(torch.tensor((y == i) * labled, dtype=torch.float32))
+            n_inds_y.append(torch.tensor(max([1., torch.sum(inds_y[i])]), dtype=torch.float32))
+        for i in range(n_cls):
+            tmpl_i = torch.ones(y.shape, dtype=torch.int32)*i
+            losses = torch.tensor(self.CEL(x, tmpl_i), dtype=torch.float32)
+            unrisk.append(torch.sum(losses * torch.tensor(unlabled, dtype=torch.float32)) / n_unlabled)
+            nn_risk_y = 0
+            for j in range(n_cls):
+                if j != i:
+                    nn_risk_y += torch.sum(losses * inds_y[j]) / n_inds_y[j] * self.prior[j]
+
+            self.loss = torch.sum(losses * inds_y[i]) / n_inds_y[i] * self.prior[i]
+            self.loss += self.alpha * max([unrisk[i] - nn_risk_y, self.beta]) / n_cls
+
+        return self.loss
+
+
+
+class MNISTDisCov(nn.Module):
+    def __init__(self, noise_size, num_label, image_size=28*28):
+        super(MNISTDisCov, self).__init__()
+
+        self.noise_size = noise_size
+        self.image_size = image_size
+        self.num_label = num_label
+        self.att_simi = 'Euclid'
+        self.need_att = True
+        self.feat_net = nn.Sequential(
+            WN_Conv2d(1, 32, 3, padding=True), WN_Conv2d(32, 32, 3, padding=True), nn.MaxPool2d(2),
+            WN_Conv2d(32, 64, 3, padding=True), WN_Conv2d(64, 64, 3, padding=True), nn.MaxPool2d(2),
+            WN_Conv2d(64, 128, 3, padding=True), WN_Conv2d(128, 128, 3, padding=True), nn.MaxPool2d(2),
+
+            Expression(lambda tensor: tensor.view(-1, 128*3*3)),
+        )
+
+        self.out_net = nn.Sequential(
+            GaussianNoise(0.5),
+            WN_Linear(128*3*3, self.num_label, train_scale=True)
+        )
+
+    def forward(self, l_X, un_X, feat=False):
+        if l_X.dim() == 4:
+            l_X = l_X.view(l_X.size(0), -1)
+            un_X = un_X.view(un_X.size(0), -1)
+
+        X = torch.cat((l_X, un_X))
+        n_l = l_X.shape[0]
+        X_fea = self.feat_net(X)
+        l_feat, un_feat = X_fea[:n_l], X_fea[n_l:]
+        #l_feat, un_feat = self.feat_net(l_X), self.feat_net(un_X)
+
+        if self.training is True:
+            if self.need_att is True:
+                att1, att2 = self.get_att(l_feat, un_feat)
+                l_att_feat, un_att_feat = att2.mm(un_feat), att1.transpose(0,1).mm(l_feat)
+
+                return (self.out_net(l_feat), self.out_net(un_feat)), (self.out_net(l_att_feat), self.out_net(un_att_feat))
+        else:
+            return self.out_net(l_feat), self.out_net(un_feat)
+
+    def get_feat(self, X):
+        if X.dim() == 4:
+            X = X.view(X.size(0),-1)
+
+        return self.out_net(self.feat_net(X))
+
+    def set_att_simi(self, simimeasure='inner_prod'):
+        self.att_simi = simimeasure
+
+    def get_att(self, X1, X2):
+        n1, n2 = X1.shape[0], X2.shape[0]
+        if self.att_simi == 'inner_prod':
+            mat = X1.mm(X2.transpose(0, 1))
+        elif self.att_simi == 'Euclid':
+            mat = torch.empty(n1, n2)
+            for i in range(n1):
+                mat[i] = -torch.sum((X2-X1[i])**2,1)
+        else:
+            raise ValueError('no such similarity measure, the candidates are: inner_prod and Euclid')
+        atten1, atten2 = F.softmax(mat, 0), F.softmax(mat, 1)
+
+        return atten1, atten2
+
+
+
+class MNISTDiscriminative(nn.Module):
+    def __init__(self, noise_size, num_label, image_size=28*28):
+        super(MNISTDiscriminative, self).__init__()
+
+        self.noise_size = noise_size
+        self.image_size = image_size
+        self.num_label = num_label
+        self.att_simi = 'Euclid'
+        self.need_att = True
+        self.feat_net = nn.Sequential(
+            GaussianNoise(0.3), WN_Linear(self.image_size, 1000), nn.ReLU(),
+            GaussianNoise(0.5), WN_Linear(1000, 500), nn.ReLU(),
+            GaussianNoise(0.5), WN_Linear( 500, 250), nn.ReLU(),
+            GaussianNoise(0.5), WN_Linear( 250, 250), nn.ReLU(),
+            GaussianNoise(0.5), WN_Linear( 250, 250), nn.ReLU(),
+        )
+
+        self.out_net = nn.Sequential(
+            GaussianNoise(0.5),
+            WN_Linear(250, self.num_label, train_scale=True)
+        )
+
+    def forward(self, l_X, un_X, feat=False):
+        if l_X.dim() == 4:
+            l_X = l_X.view(l_X.size(0), 1, 28, 28)
+            un_X = un_X.view(un_X.size(0), 1, 28, 28)
+
+        X = torch.cat((l_X, un_X))
+        n_l = l_X.shape[0]
+        X_fea = self.feat_net(X)
+        l_feat, un_feat = X_fea[:n_l], X_fea[n_l:]
+#        l_feat, un_feat = self.feat_net(l_X), self.feat_net(un_X)
+
+        if self.training is True:
+            if self.need_att is True:
+                att1, att2 = self.get_att(l_feat, un_feat)
+                l_att_feat, un_att_feat = att2.mm(un_feat), att1.transpose(0,1).mm(l_feat)
+
+                return (self.out_net(l_feat), self.out_net(un_feat)), (self.out_net(l_att_feat), self.out_net(un_att_feat))
+        else:
+            return self.out_net(l_feat), self.out_net(un_feat)
+
+    def get_feat(self, X):
+        if X.dim() == 4:
+            X = X.view(X.size(0),-1)
+
+        return self.out_net(self.feat_net(X))
+
+    def set_att_simi(self, simimeasure='inner_prod'):
+        self.att_simi = simimeasure
+
+    def get_att(self, X1, X2):
+        n1, n2 = X1.shape[0], X2.shape[0]
+        if self.att_simi == 'inner_prod':
+            mat = X1.mm(X2.transpose(0, 1))
+        elif self.att_simi == 'Euclid':
+            mat = torch.empty(n1, n2)
+            for i in range(n1):
+                mat[i] = -torch.sum((X2-X1[i])**2,1)
+        else:
+            raise ValueError('no such similarity measure, the candidates are: inner_prod and Euclid')
+        atten1, atten2 = F.softmax(mat, 0), F.softmax(mat, 1)
+
+        return atten1, atten2
+
+
+
 class GaussianNoise(nn.Module):
     def __init__(self, sigma):
         super(GaussianNoise, self).__init__()
